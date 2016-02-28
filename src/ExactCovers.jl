@@ -131,6 +131,7 @@ end
 type ElementHeader
   element
   count::Int
+  isprimary::Bool
 end
 
 typealias ElementNode Node{ElementHeader}
@@ -145,14 +146,15 @@ typealias Cell Node{CellData}
 type CoverMatrixHeader
   elements::Dict{Any, ElementNode}
   subsets::Dict{Any, Cell}
+  visible_primary_element_count::Int
 
-  CoverMatrixHeader() = new(Dict{Any, ElementNode}(), Dict{Any, Cell}())
+  CoverMatrixHeader() = new(Dict{Any, ElementNode}(), Dict{Any, Cell}(), 0)
 end
 
 typealias CoverMatrix Node{CoverMatrixHeader}
 
 "Constructs a `CoverMatrix` from the given `Dict`. (See the module description)"
-function CoverMatrix{K,V}(data::Dict{K, Set{V}})
+function CoverMatrix{K,V}(data::Dict{K, Set{V}}; optionals::Set{V} = Set{V}())
   result = CoverMatrix(CoverMatrixHeader())
 
   # Constructs the `CoverMatrix` row-by-row.
@@ -177,7 +179,8 @@ function CoverMatrix{K,V}(data::Dict{K, Set{V}})
     # need to create one (with `append_element!`). After that, it's the same as
     # above.
     for element in rest
-      element_node = append_element!(result, element)
+      isprimary = !in(element, optionals)
+      element_node = append_element!(result, element, isprimary)
       append_cell!(result, element_node, key)
     end
   end
@@ -192,12 +195,13 @@ then returns it.
 This function is a helper for the construction of the matrix. It must be called
 at most once for each element.
 """
-function append_element!(matrix::CoverMatrix, element)
+function append_element!(matrix::CoverMatrix, element, isprimary::Bool)
+  matrix.payload.visible_primary_element_count += isprimary
   # Note: `matrix` is the sentinel for the (linked cyclic) element list, hence
   #   `matrix.left` is the last `ElementNode`.
   matrix.payload.elements[element] = append_right!(
     matrix.left,
-    ElementNode(ElementHeader(element, 0))
+    ElementNode(ElementHeader(element, 0, isprimary))
   )
 end
 
@@ -206,7 +210,7 @@ Inserts a new cell into the incidence matrix.
 
 The cell is linked so that it is in `element_node`'s column and in the row
 corresponding to the subset identified by `key`. This must be called in
-top-down, left-to-right order.
+left-to-right, top-down order.
 """
 function append_cell!(matrix::CoverMatrix, element_node::ElementNode, key)
   cell = append_down!(element_node.up, Cell(CellData(element_node, key)))
@@ -285,11 +289,11 @@ function enumerate_exact_covers!(
   found = 0
   element_node = find_minimal_element_node(matrix)
 
-  cover_element!(element_node)
+  cover_element_node!(matrix, element_node)
   for element_cell in cells(element_node)
     produce_traces && push!(stack, element_cell)
     for cell in other_cells_in_subset(element_cell)
-      cover_element!(cell.payload.element_node)
+      cover_element_node!(matrix, cell.payload.element_node)
     end
 
     found += enumerate_exact_covers!(
@@ -300,7 +304,7 @@ function enumerate_exact_covers!(
     )
 
     for cell in other_cells_in_subset_reverse(element_cell)
-      uncover_element!(cell.payload.element_node)
+      uncover_element_node!(matrix, cell.payload.element_node)
     end
     produce_traces && pop!(stack)
 
@@ -308,16 +312,29 @@ function enumerate_exact_covers!(
       break
     end
   end
-  uncover_element!(element_node)
+  uncover_element_node!(matrix, element_node)
 
   found
 end
 
+"Determines whether at least one uncovered primary element exists."
+is_completely_covered(matrix::CoverMatrix) =
+  matrix.payload.visible_primary_element_count == 0
+
+"""
+Finds the uncovered primary element node that is contained in the fewest uncovered
+subsets.
+
+Precondition: At least one uncovered primary element must exist.
+"""
 function find_minimal_element_node(matrix::CoverMatrix)
   nodes = element_nodes(matrix)
+
   minimal_node = consume(nodes)
   for node in nodes
-    if node.payload.count < minimal_node.payload.count
+    if !minimal_node.payload.isprimary
+      minimal_node = node
+    elseif node.payload.isprimary && node.payload.count < minimal_node.payload.count
       minimal_node = node
     end
   end
@@ -326,8 +343,9 @@ function find_minimal_element_node(matrix::CoverMatrix)
 end
 
 "Implements the cover operation from the referenced paper."
-function cover_element!(element_node::ElementNode)
+function cover_element_node!(matrix::CoverMatrix, element_node::ElementNode)
   detach_horizontally!(element_node)
+  matrix.payload.visible_primary_element_count -= element_node.payload.isprimary
   for element_cell in cells(element_node)
     for cell in other_cells_in_subset(element_cell)
       detach_vertically!(cell)
@@ -341,11 +359,11 @@ Looks up the `ElementNode` for `element` and then executes an cover operation
 on it.
 """
 function cover_element!(matrix::CoverMatrix, element)
-  cover_element!(matrix.payload.elements[element])
+  cover_element_node!(matrix, matrix.payload.elements[element])
 end
 
 "Implements the uncover operation from the referenced paper."
-function uncover_element!(element_node::ElementNode)
+function uncover_element_node!(matrix::CoverMatrix, element_node::ElementNode)
   for element_cell in cells_reverse(element_node)
     for cell in other_cells_in_subset_reverse(element_cell)
       reattach_vertically!(cell)
@@ -353,6 +371,7 @@ function uncover_element!(element_node::ElementNode)
     end
   end
   reattach_horizontally!(element_node)
+  matrix.payload.visible_primary_element_count += element_node.payload.isprimary
 end
 
 """
@@ -360,7 +379,7 @@ Looks up the `ElementNode` for `element` and then executes an uncover operation
 on it.
 """
 function uncover_element!(matrix::CoverMatrix, element)
-  uncover_element!(matrix.payload.elements[element])
+  uncover_element_node!(matrix, matrix.payload.elements[element])
 end
 
 """
@@ -377,7 +396,7 @@ This operation can be undone by `uncover_subset!`, which means that a single
 function cover_subset!(matrix::CoverMatrix, key)
   for cell = cells_in_subset(matrix.payload.subsets[key])
     detach_vertically!(cell)
-    cover_element!(cell.payload.element_node)
+    cover_element_node!(matrix, cell.payload.element_node)
   end
 end
 
@@ -390,12 +409,10 @@ to heed this advice will result in chaos and madness.
 """
 function uncover_subset!(matrix::CoverMatrix, key)
   for cell = cells_in_subset_reverse(matrix.payload.subsets[key])
-    uncover_element!(cell.payload.element_node)
+    uncover_element_node!(matrix, cell.payload.element_node)
     reattach_vertically!(cell)
   end
 end
-
-is_completely_covered(matrix::CoverMatrix) = matrix.right == matrix
 
 "Counts the possible exact covers of `matrix`."
 exact_cover_count(matrix::CoverMatrix) = enumerate_exact_covers!(matrix)
