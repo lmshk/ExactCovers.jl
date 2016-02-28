@@ -22,8 +22,6 @@
 # sudoku. Preselecting (covering) rows (subsets) now makes sure that we are
 # actually solving the given sudoku instance, instead of an empty grid.
 
-using ExactCovers
-
 "Creates the `CoverSet` that represents an empty sudoku grid."
 function make_sudoku_matrix()
   box_for(row, column) = (div(row - 1, 3) + 1, div(column - 1, 3) + 1)
